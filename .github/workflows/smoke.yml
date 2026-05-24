@@ -76,6 +76,17 @@ jobs:
             echo "KVM not present — VM lifecycle step will be skipped"
           fi
 
+      - name: Detect cgroup v2 on runner
+        id: cgroupv2
+        run: |
+          if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "Runner is cgroup v2 — LXC lifecycle step will run"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Runner is cgroup v1 — LXC lifecycle step will be skipped (PVE 9 needs v2)"
+          fi
+
       - name: Start container
         run: |
           docker run -d --rm \
@@ -165,6 +176,32 @@ jobs:
         run: |
           echo "::warning::/dev/kvm not present — VM start/stop lifecycle was not validated. \
           Use a runner with nested virtualization (e.g. GitHub larger runners with -kvm SKUs)."
+
+      - name: Verify CT lifecycle (PVE only, needs cgroup v2)
+        if: matrix.product == 'pve' && steps.cgroupv2.outputs.available == 'true'
+        run: |
+          # The PVE image bakes an Alpine 3.21 minirootfs as the fixture
+          # container at vmid 200 ("tiny-ct"). PVE 9's LXC stack requires
+          # cgroup v2 on the host kernel; if that's available we should
+          # be able to start the container.
+          docker exec pve-test pct config 200
+          docker exec pve-test pct status 200
+          docker exec pve-test pct start 200
+          sleep 3
+          status=$(docker exec pve-test pct status 200 | awk '{print $2}')
+          [ "$status" = "running" ] || { echo "::error::CT didn't start; status=$status"; exit 1; }
+          # Run a command inside the CT to prove userspace is alive.
+          docker exec pve-test pct exec 200 -- sh -c 'echo "alpine $(cat /etc/alpine-release)"'
+          docker exec pve-test pct stop 200
+          status=$(docker exec pve-test pct status 200 | awk '{print $2}')
+          [ "$status" = "stopped" ] || { echo "::error::pct stop failed; status=$status"; exit 1; }
+          echo "CT lifecycle ok"
+
+      - name: Skip CT lifecycle (cgroup v1 runner)
+        if: matrix.product == 'pve' && steps.cgroupv2.outputs.available != 'true'
+        run: |
+          echo "::warning::Runner is cgroup v1 — LXC lifecycle was not validated. \
+          PVE 9 LXC requires cgroup v2 (default on ubuntu-22.04+ GitHub-hosted runners)."
 
       - name: Verify password-based ticket auth works (PVE/PMG only)
         if: matrix.product == 'pve' || matrix.product == 'pmg'

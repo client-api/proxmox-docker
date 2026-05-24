@@ -46,8 +46,6 @@ test code can read `token_header_value` directly without branching on product.
 
 ### What does NOT work in these images
 
-- LXC container lifecycle (PVE's LXC stack expects to own the cgroup
-  hierarchy directly, which Docker doesn't let it do)
 - Real backups against a backing datastore (PBS spins up but datastore
   I/O is limited)
 - Mail filtering (PMG; no real Postfix backend)
@@ -55,25 +53,40 @@ test code can read `token_header_value` directly without branching on product.
 - API-token auth against PMG (the API surface itself doesn't expose
   tokens)
 
-### Bonus: working KVM lifecycle in PVE
+### Working KVM and LXC lifecycle in PVE
 
-The PVE image runs systemd as PID 1 and ships a 1 MiB SeaBIOS-bootable
-**fixture VM at vmid 100** (`tiny-test`), backed by the
-[256-byte-vm](https://github.com/client-api/256-byte-vm) release asset.
-If you pass `--device /dev/kvm` to `docker run` and the host has KVM,
-the full lifecycle works:
+The PVE image runs systemd as PID 1 and ships two fixtures so SDK
+tests can drive real start/stop/exec lifecycles, not just config-
+level CRUD:
+
+| Fixture | vmid | Source | Host requirement |
+|---------|------|--------|------------------|
+| **VM** `tiny-test` (`qm`) | 100 | [256-byte-vm](https://github.com/client-api/256-byte-vm) v1.0.0 — 1 MiB SeaBIOS-bootable | `--device /dev/kvm` |
+| **CT** `tiny-ct` (`pct`) | 200 | Alpine 3.21 minirootfs                                                   | cgroup v2 on the host |
 
 ```bash
-docker exec pve-test qm start 100         # VM boots in <1 s
+# VMs — needs /dev/kvm
+docker exec pve-test qm start 100         # boots in <1 s
 docker exec pve-test qm shutdown 100      # ACPI handler exits cleanly
 docker exec pve-test qm stop 100          # hard kill
-docker exec pve-test qm list              # confirm status
+
+# Containers — needs cgroupv2 host
+docker exec pve-test pct start 200
+docker exec pve-test pct exec 200 -- sh -c 'echo "alpine $(cat /etc/alpine-release)"'
+docker exec pve-test pct stop 200
 ```
 
-This lets SDK tests exercise the start/stop/migrate-prep/snapshot
-endpoints against a real running VM, not just config-level CRUD.
-Without `/dev/kvm` the config endpoints still work — `qm start` is the
-only operation that hard-fails.
+Without `/dev/kvm` or cgroupv2, the matching config endpoints still
+work (`qm list`, `pct config`, snapshot/clone config). Only the
+`start` operation hard-fails. WSL2 hosts default to cgroupv1 (LXC
+won't start); ubuntu-22.04+ GitHub-hosted runners default to cgroupv2
+(everything works).
+
+Disable either fixture at runtime:
+
+```bash
+docker run … -e PVE_SEED_FIXTURE_VM=0 -e PVE_SEED_FIXTURE_CT=0 …
+```
 
 This is intentional. The images exist to let SDK client tests exercise the API
 layer — request shape, response parsing, auth, pagination, error envelopes —

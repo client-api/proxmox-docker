@@ -46,22 +46,37 @@ RUN rm -f /etc/dpkg/dpkg.cfg.d/docker
 RUN apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        e2fsprogs \
         iproute2 \
         jq \
         proxmox-ve \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Pull the 256-byte-vm fixture disk used by the lifecycle smoke tests.
+# --- KVM fixture (256-byte-vm v1.0.0) -------------------------------------
 # 1 MiB virtual qcow2; SeaBIOS-bootable; the guest installs an ACPI
 # power-button handler so `qm shutdown` exits cleanly to S5 instead of
-# being force-killed. SHA256 from upstream SHA256SUMS verifies the
-# bytes haven't drifted between the release tag and us.
+# being force-killed. SHA256 verified at build time.
 ARG TINY_VM_VERSION=v1.0.0
 ARG TINY_VM_SHA256=621533eea8fb3d955e5be11fd47ee0d25a74cc08d2e46b7f914710e950a729ac
 RUN install -d /usr/local/share/proxmox-docker \
  && curl -fsSL -o /usr/local/share/proxmox-docker/boot.qcow2 \
         "https://github.com/client-api/256-byte-vm/releases/download/${TINY_VM_VERSION}/boot.qcow2" \
  && echo "${TINY_VM_SHA256}  /usr/local/share/proxmox-docker/boot.qcow2" \
+        | sha256sum -c -
+
+# --- LXC fixture (Alpine 3.21 minirootfs) ---------------------------------
+# Alpine ships an officially-published 3.5 MB tarball-rootfs we can drop
+# straight into PVE's template cache. The boot script then calls
+# `pct create 200 ...` against it. SHA256 from latest-releases.yaml.
+ARG ALPINE_TEMPLATE_VERSION=3.21.7
+ARG ALPINE_TEMPLATE_DATE=20260415
+ARG ALPINE_TEMPLATE_SHA256=8cba1ea3e8b500ea986a313d8eecf3d5952a2a0d23a69117bb81c023d9ceac05
+ENV ALPINE_TEMPLATE_NAME=alpine-3.21-default_${ALPINE_TEMPLATE_DATE}_amd64.tar.gz
+RUN install -d /var/lib/vz/template/cache \
+ && curl -fsSL \
+        -o "/var/lib/vz/template/cache/${ALPINE_TEMPLATE_NAME}" \
+        "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-${ALPINE_TEMPLATE_VERSION}-x86_64.tar.gz" \
+ && echo "${ALPINE_TEMPLATE_SHA256}  /var/lib/vz/template/cache/${ALPINE_TEMPLATE_NAME}" \
         | sha256sum -c -
 
 # Hide the no-subscription nag in the web UI.
