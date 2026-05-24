@@ -5,6 +5,13 @@ as part of a GitHub Actions workflow. The images exist so SDK clients
 generated from the Proxmox OpenAPI specs can be tested against a real
 Proxmox API surface; everything below assumes that use case.
 
+> **Looking for the one-liner?** Use the companion action
+> [`client-api/proxmox-docker-action`](https://github.com/client-api/proxmox-docker-action)
+> — it wraps everything below into a single `uses:` step (KVM udev rule,
+> container start + healthcheck wait, credential export, post-step
+> cleanup). The recipes here are for callers that need finer control
+> than the action exposes.
+
 Sections:
 
 - [Picking an image tag](#picking-an-image-tag)

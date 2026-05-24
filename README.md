@@ -184,7 +184,33 @@ Override the password by setting `PVE_ROOT_PASSWORD`, `PBS_ROOT_PASSWORD`,
 
 ## GitHub Actions
 
-Drop-in service-container snippet for SDK E2E tests:
+For SDK E2E suites the easiest path is the dedicated companion action,
+[`client-api/proxmox-docker-action`](https://github.com/client-api/proxmox-docker-action):
+
+```yaml
+- uses: docker/login-action@v3
+  with:
+    registry: ghcr.io
+    username: ${{ github.actor }}
+    password: ${{ secrets.GITHUB_TOKEN }}
+
+- uses: client-api/proxmox-docker-action@v1
+  with:
+    product: pve
+    tag: '9.2'
+
+- run: pnpm test:e2e:pve
+  env:
+    NODE_TLS_REJECT_UNAUTHORIZED: '0'
+```
+
+The action handles the udev rule for `/dev/kvm`, container start +
+healthcheck wait, exporting credentials as `PROXMOX_*` env vars, and
+cleaning up via a `post:` step. Full input/output reference + matrix
+and lifecycle-gate examples are in the action repo's README.
+
+For tighter control (custom networking, volume mounts, multiple
+containers in one job, …), drop down to a raw service container:
 
 ```yaml
 jobs:
