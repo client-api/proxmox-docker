@@ -1,0 +1,9 @@
+.git
+.github
+docs
+examples
+README.md
+LICENSE
+*.md
+.gitignore
+.dockerignore

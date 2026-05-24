@@ -1,0 +1,144 @@
+name: Smoke test
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - '.gitignore'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Read-only against GHCR — we build locally and never push from this
+  # workflow.
+  packages: read
+
+jobs:
+  smoke:
+    name: smoke-${{ matrix.product }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - product: pve
+            port: 8006
+            health_path: /api2/json/version
+            token_prefix: PVEAPIToken
+          - product: pbs
+            port: 8007
+            health_path: /api2/json/version
+            token_prefix: PBSAPIToken
+          - product: pmg
+            port: 8006
+            health_path: /api2/json/version
+            token_prefix: PMGAPIToken
+          - product: pdm
+            port: 8443
+            health_path: /api2/extjs/version
+            token_prefix: PDMAPIToken
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (cached from build workflow)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.product }}/Dockerfile
+          load: true
+          tags: ${{ matrix.product }}-test:smoke
+          platforms: linux/amd64
+          cache-from: type=gha,scope=${{ matrix.product }}
+
+      - name: Start container
+        run: |
+          docker run -d --rm \
+            --name ${{ matrix.product }}-test \
+            --privileged \
+            --device /dev/fuse \
+            -p ${{ matrix.port }}:${{ matrix.port }} \
+            ${{ matrix.product }}-test:smoke
+
+      - name: Wait for container health
+        id: health
+        run: |
+          # Poll the Docker healthcheck status for up to 3 minutes.
+          for i in $(seq 1 36); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' \
+              ${{ matrix.product }}-test 2>/dev/null || echo "unknown")
+            echo "health=$status (attempt $i/36)"
+            if [ "$status" = "healthy" ]; then
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$status" = "unhealthy" ]; then
+              echo "::error::Container reported unhealthy"
+              break
+            fi
+            sleep 5
+          done
+          echo "::error::Container did not become healthy within 3 minutes"
+          exit 1
+
+      - name: Hit version endpoint
+        run: |
+          curl -ksSf \
+            "https://localhost:${{ matrix.port }}${{ matrix.health_path }}" \
+            | jq .
+
+      - name: Read baked-in credentials
+        id: creds
+        run: |
+          docker exec ${{ matrix.product }}-test cat /run/credentials.json | tee creds.json
+          echo "creds_path=$PWD/creds.json" >> "$GITHUB_OUTPUT"
+
+      - name: Verify token-based auth works
+        run: |
+          token_value=$(jq -r .token_value creds.json)
+          token_id=$(jq -r .token_id creds.json)
+          if [ "$token_value" = "(unavailable)" ] || [ -z "$token_value" ]; then
+            echo "::warning::Token unavailable; skipping token-auth check (password auth still works)"
+            exit 0
+          fi
+          curl -ksSf \
+            -H "Authorization: ${token_id}=${token_value}" \
+            "https://localhost:${{ matrix.port }}${{ matrix.health_path }}" \
+            | jq .
+
+      - name: Verify password-based ticket auth works (PVE/PMG only)
+        if: matrix.product == 'pve' || matrix.product == 'pmg'
+        run: |
+          # Ticket auth: POST username+password to /access/ticket, get a
+          # cookie back + a CSRFPreventionToken. This is the auth path
+          # the generated TS/Python/Go SDK clients exercise.
+          response=$(curl -ksS \
+            -d "username=root@pam&password=proxmox123" \
+            "https://localhost:${{ matrix.port }}/api2/json/access/ticket")
+          echo "$response" | jq .
+          ticket=$(echo "$response" | jq -r .data.ticket)
+          csrf=$(echo "$response" | jq -r .data.CSRFPreventionToken)
+          test -n "$ticket"
+          test -n "$csrf"
+          test "$ticket" != "null"
+          test "$csrf" != "null"
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker logs ${{ matrix.product }}-test || true
+
+      - name: Stop container
+        if: always()
+        run: docker stop ${{ matrix.product }}-test || true

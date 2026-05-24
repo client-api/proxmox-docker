@@ -1,0 +1,118 @@
+name: Build and publish
+
+# Push/PR-driven build. Always targets the *stable* (no-subscription)
+# channel — that's what callers pull by default and what should be
+# rebuilt every time the Dockerfile or entrypoint changes.
+#
+# The :dev (testing-channel) image is rebuilt by nightly.yml, not here.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - '.gitignore'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: build-${{ matrix.product }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        product: [pve, pbs, pmg, pdm]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # First, build but don't push — we need the image locally so we can
+      # read /etc/proxmox-version out of it to derive the version tag.
+      - name: Build image (no push)
+        id: build_only
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.product }}/Dockerfile
+          load: true
+          tags: ${{ matrix.product }}-test:build
+          platforms: linux/amd64
+          build-args: |
+            PROXMOX_CHANNEL=no-subscription
+          cache-from: type=gha,scope=${{ matrix.product }}-stable
+          cache-to: type=gha,scope=${{ matrix.product }}-stable,mode=max
+
+      - name: Read package version from image
+        id: ver
+        run: |
+          version=$(docker run --rm --entrypoint cat \
+            ${{ matrix.product }}-test:build /etc/proxmox-version | tr -d '\r')
+          # Strip the Debian revision suffix (e.g. "9.2.2-1" → "9.2.2")
+          # so it's safe as a Docker tag. Also derive the major.minor
+          # view ("9.2") for the floating series tag.
+          short="${version%%-*}"
+          minor=$(echo "$short" | awk -F. '{print $1"."$2}')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "short_version=$short" >> "$GITHUB_OUTPUT"
+          echo "minor_version=$minor" >> "$GITHUB_OUTPUT"
+          echo "[derived] full=$version short=$short minor=$minor"
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/proxmox-docker/${{ matrix.product }}-test
+          # Tag scheme for the stable channel — see VERSIONING.md.
+          #   latest               — only on main
+          #   <version>            — e.g. "9.2.2" (full upstream version)
+          #   <major>.<minor>      — e.g. "9.2" (floats within the series)
+          #   <branch>             — e.g. "main" for non-default branches
+          #   pr-NNN               — pull-request builds
+          #   sha-<short>          — every build (immutable reference)
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ steps.ver.outputs.short_version }},enable={{is_default_branch}}
+            type=raw,value=${{ steps.ver.outputs.minor_version }},enable={{is_default_branch}}
+            type=ref,event=branch,enable=${{ github.ref != 'refs/heads/main' }}
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,format=short
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.product }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          build-args: |
+            PROXMOX_CHANNEL=no-subscription
+          cache-from: type=gha,scope=${{ matrix.product }}-stable
+          cache-to: type=gha,scope=${{ matrix.product }}-stable,mode=max

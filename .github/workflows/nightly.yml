@@ -1,0 +1,251 @@
+name: Nightly rebuild
+
+# Nightly rebuild of every product against BOTH channels:
+#   - stable  (no-subscription)  → tagged :latest + :<version>
+#   - dev     (test channel)     → tagged :dev    + :dev-<version>
+#
+# The push-driven build.yml only ever produces stable images, so this
+# job is what surfaces upstream package updates between code changes.
+# A failing nightly is the early-warning signal that an upstream
+# package change broke the Dockerfile or the entrypoint.
+
+on:
+  schedule:
+    # 03:17 UTC — staggered off the hour so we don't pile up alongside
+    # everyone else's nightly cron.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      channels:
+        description: 'Comma-separated channels to build (stable,dev)'
+        type: string
+        default: 'stable,dev'
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: nightly-${{ matrix.product }}-${{ matrix.channel }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        product: [pve, pbs, pmg, pdm]
+        channel: [stable, dev]
+        include:
+          - channel: stable
+            apt_component: no-subscription
+            primary_tag: latest
+            cache_scope_suffix: stable
+          - channel: dev
+            apt_component: test
+            primary_tag: dev
+            cache_scope_suffix: dev
+
+    steps:
+      - name: Skip channel?
+        id: gate
+        run: |
+          channels="${{ github.event.inputs.channels || 'stable,dev' }}"
+          if echo ",$channels," | grep -q ",${{ matrix.channel }},"; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "channel ${{ matrix.channel }} not in '$channels' — skipping"
+          fi
+
+      - name: Checkout
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        if: steps.gate.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.gate.outputs.skip != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (no push) to read version
+        if: steps.gate.outputs.skip != 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.product }}/Dockerfile
+          load: true
+          tags: ${{ matrix.product }}-test:nightly-build
+          platforms: linux/amd64
+          build-args: |
+            PROXMOX_CHANNEL=${{ matrix.apt_component }}
+          cache-from: type=gha,scope=${{ matrix.product }}-${{ matrix.cache_scope_suffix }}
+          cache-to: type=gha,scope=${{ matrix.product }}-${{ matrix.cache_scope_suffix }},mode=max
+
+      - name: Read package version from image
+        if: steps.gate.outputs.skip != 'true'
+        id: ver
+        run: |
+          version=$(docker run --rm --entrypoint cat \
+            ${{ matrix.product }}-test:nightly-build /etc/proxmox-version | tr -d '\r')
+          short="${version%%-*}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "short_version=$short" >> "$GITHUB_OUTPUT"
+          echo "[derived] product=${{ matrix.product }} channel=${{ matrix.channel }} version=$short"
+
+      - name: Derive image tags
+        if: steps.gate.outputs.skip != 'true'
+        id: tags
+        run: |
+          owner="${{ github.repository_owner }}"
+          product="${{ matrix.product }}"
+          channel="${{ matrix.channel }}"
+          version="${{ steps.ver.outputs.short_version }}"
+          today=$(date -u +%Y%m%d)
+          base="ghcr.io/${owner}/proxmox-docker/${product}-test"
+
+          # Derive a major.minor view of the version (e.g. "9.2.2" → "9.2")
+          # for the floating series tag promised in VERSIONING.md.
+          minor=$(echo "$version" | awk -F. '{print $1"."$2}')
+
+          if [ "$channel" = "stable" ]; then
+            # Stable channel:
+            #   :latest               most recent successful nightly
+            #   :<version>            e.g. "9.2.2" — what apt installed today
+            #   :<major>.<minor>      floats forward within a minor series
+            #   :stable-<YYYYMMDD>    immutable point-in-time reference
+            tags="${base}:latest
+          ${base}:${version}
+          ${base}:${minor}
+          ${base}:stable-${today}"
+          else
+            # Dev channel:
+            #   :dev                  most recent dev build
+            #   :dev-<version>        package version from the test channel today
+            #   :dev-<YYYYMMDD>       immutable point-in-time reference
+            tags="${base}:dev
+          ${base}:dev-${version}
+          ${base}:dev-${today}"
+          fi
+          # docker/build-push-action expects newline-separated tags.
+          {
+            echo 'tags<<EOF'
+            echo "$tags"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push image
+        if: steps.gate.outputs.skip != 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.product }}/Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          platforms: linux/amd64
+          build-args: |
+            PROXMOX_CHANNEL=${{ matrix.apt_component }}
+          cache-from: type=gha,scope=${{ matrix.product }}-${{ matrix.cache_scope_suffix }}
+          cache-to: type=gha,scope=${{ matrix.product }}-${{ matrix.cache_scope_suffix }},mode=max
+
+  # Sanity-check that every nightly image actually boots and answers
+  # its API. A green build + red smoke means upstream broke something.
+  smoke:
+    name: smoke-${{ matrix.product }}-${{ matrix.channel }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - product: pve
+            channel: stable
+            port: 8006
+            health_path: /api2/json/version
+          - product: pve
+            channel: dev
+            port: 8006
+            health_path: /api2/json/version
+          - product: pbs
+            channel: stable
+            port: 8007
+            health_path: /api2/json/version
+          - product: pbs
+            channel: dev
+            port: 8007
+            health_path: /api2/json/version
+          - product: pmg
+            channel: stable
+            port: 8006
+            health_path: /api2/json/version
+          - product: pmg
+            channel: dev
+            port: 8006
+            health_path: /api2/json/version
+          - product: pdm
+            channel: stable
+            port: 8443
+            health_path: /api2/extjs/version
+          - product: pdm
+            channel: dev
+            port: 8443
+            health_path: /api2/extjs/version
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tag for channel
+        id: img
+        run: |
+          owner="${{ github.repository_owner }}"
+          if [ "${{ matrix.channel }}" = "stable" ]; then
+            echo "ref=ghcr.io/${owner}/proxmox-docker/${{ matrix.product }}-test:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=ghcr.io/${owner}/proxmox-docker/${{ matrix.product }}-test:dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Start container
+        run: |
+          docker run -d --rm \
+            --name proxmox-test \
+            --privileged \
+            --device /dev/fuse \
+            -p ${{ matrix.port }}:${{ matrix.port }} \
+            ${{ steps.img.outputs.ref }}
+
+      - name: Wait for healthy
+        run: |
+          for i in $(seq 1 36); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' proxmox-test 2>/dev/null || echo "unknown")
+            echo "health=$status (attempt $i/36)"
+            if [ "$status" = "healthy" ]; then exit 0; fi
+            sleep 5
+          done
+          echo "::error::Container did not become healthy"
+          docker logs proxmox-test
+          exit 1
+
+      - name: Hit version endpoint
+        run: |
+          curl -ksSf "https://localhost:${{ matrix.port }}${{ matrix.health_path }}" | jq .
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker logs proxmox-test || true
+
+      - name: Stop container
+        if: always()
+        run: docker stop proxmox-test || true
