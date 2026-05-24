@@ -1,5 +1,9 @@
 # Troubleshooting
 
+For step-by-step CI integration recipes, see
+[`github-actions.md`](./github-actions.md). This file is a flat catalogue
+of things that have broken in practice + how each was diagnosed.
+
 ## Container exits immediately with "pmxcfs failed to mount /etc/pve"
 
 `pmxcfs` is a FUSE filesystem. It needs:
@@ -14,9 +18,18 @@ GitHub Actions service containers:
 ```yaml
 services:
   pve:
-    image: ghcr.io/client-api/proxmox-docker/pve-test:latest
-    options: --privileged --device /dev/fuse
+    image: ghcr.io/client-api/proxmox-docker/pve-test:9.2
+    options: >-
+      --privileged
+      --device /dev/fuse
+      --tmpfs /tmp
+      --tmpfs /run
+      --tmpfs /run/lock
 ```
+
+The three `--tmpfs` mounts are for systemd-as-PID-1 inside the PVE
+image; without them PVE's units fail to start and the container goes
+unhealthy after the 60 s start period.
 
 If you really need to avoid `--privileged`, the minimum is:
 
@@ -26,8 +39,11 @@ If you really need to avoid `--privileged`, the minimum is:
 --security-opt apparmor:unconfined
 ```
 
-On Docker Desktop (macOS/Windows) the FUSE device sometimes isn't exposed
-to the VM. Use the `--privileged` flag and verify with
+…but you also lose KVM, LXC, and the systemd cgroup hierarchy, so
+none of the lifecycle endpoints will work.
+
+On Docker Desktop (macOS/Windows) the FUSE device sometimes isn't
+exposed to the VM. Use the `--privileged` flag and verify with
 `docker exec <ct> ls /dev/fuse`.
 
 ## "Container reported unhealthy" in CI
@@ -133,18 +149,111 @@ FROM ghcr.io/client-api/proxmox-docker/pve-test:latest
 RUN rm -rf /usr/share/doc /usr/share/man /usr/share/locale
 ```
 
+## `qm start 100` fails with "could not connect to KVM"
+
+The `/dev/kvm` device wasn't passed through, OR the runner doesn't
+have nested virtualization. Two cases:
+
+**`/dev/kvm` exists but isn't readable by the test step.** Default on
+`ubuntu-latest` (the device is owned `root:kvm 0660` and the runner
+user isn't in `kvm`). Add the udev rule snippet from
+[github-actions.md → Enabling KVM](./github-actions.md#enabling-kvm-real-vm-lifecycle).
+
+**`/dev/kvm` is genuinely missing.** Self-hosted runner without nested
+virt, or a larger-runner SKU that didn't include the `-kvm` variant.
+Skip the lifecycle step:
+
+```yaml
+- name: Detect /dev/kvm
+  id: kvm
+  run: |
+    if [ -r /dev/kvm ]; then
+      echo "available=true" >> "$GITHUB_OUTPUT"
+    else
+      echo "available=false" >> "$GITHUB_OUTPUT"
+    fi
+
+- name: VM lifecycle
+  if: steps.kvm.outputs.available == 'true'
+  run: docker exec pve qm start 100
+```
+
+The rest of the API still works — only `qm start` hard-fails.
+
+## `pct start 200` fails with "Failed to run mount hooks"
+
+PVE's LXC stack pins `lxc.hook.mount = /usr/share/lxcfs/lxc.mount.hook`
+via `/usr/share/lxc/config/common.conf.d/00-lxcfs.conf`. If the
+`lxcfs` service isn't running inside the container, the hook fails
+and the CT aborts.
+
+Symptoms in the journal:
+
+```
+run_buffer: 569 Script exited with status 1
+lxc_setup: 3845 Failed to run mount hooks
+do_start: 1466 Failed to setup container "200"
+```
+
+Images built from commit `0fe0b34` and later ship a systemd drop-in
+that overrides `ConditionVirtualization=!container` so `lxcfs` runs
+inside the Docker container. Older tags don't have the fix — use a
+tag from after 2026-05-24 (`pve-test:9.2.2-1` or `pve-test:latest`).
+
+## `pct start 200` fails with "cpuset.cpus = " empty
+
+Host kernel is on cgroup v1. PVE 9's LXC stack only supports cgroup
+v2; on a v1 host it tries to auto-detect CPU pinning via
+`/sys/fs/cgroup/cgroup.controllers`, finds nothing, and writes an
+unparseable empty `lxc.cgroup.cpuset.cpus = ` line.
+
+GitHub-hosted `ubuntu-22.04+` runners use cgroup v2 by default. If
+you hit this:
+
+- On a self-hosted runner: switch to cgroup v2 in the kernel command
+  line (`systemd.unified_cgroup_hierarchy=1` on most distros,
+  `cgroup_no_v1=all` on WSL2).
+- On Docker Desktop / WSL2: add `kernelCommandLine = cgroup_no_v1=all`
+  to `[wsl2]` in `~/.wslconfig` (Windows side), then `wsl --shutdown`.
+
+The smoke workflow gates the CT lifecycle step on a cgroupv2 probe,
+so a cgroupv1 runner skips the test instead of false-failing.
+
+## `pct start 200` fails with "Failed to load generated AppArmor profile"
+
+LXC tries to load a per-CT AppArmor profile via `apparmor_parser`,
+but inside a privileged Docker container the kernel rejects
+profile-load syscalls from a non-host namespace. Symptoms:
+
+```
+run_apparmor_parser: 954 Failed to run apparmor_parser
+apparmor_prepare: 1126 Failed to load generated AppArmor profile
+lxc_init: 1069 Failed to initialize LSM
+```
+
+Images built from commit `7962baa` and later append
+`lxc.apparmor.profile: unconfined` to the seed CT config, which
+sidesteps the load entirely. Older tags don't — update.
+
 ## I need an SDK feature that needs real VM operations
 
-You can't test that against these images. Options:
+The PVE image ships a working KVM lifecycle out of the box if you
+pass `--device /dev/kvm`. The fixture VM at vmid 100 is enough for:
 
-1. Mock the VM endpoints in your test fixtures.
-2. Run the test against a real Proxmox cluster (out of scope for this
-   repo).
-3. Skip-tag the tests and exclude them from CI.
+- `qm start` / `qm stop` / `qm shutdown` / `qm reset`
+- `qm snapshot create/delete/rollback`
+- `qm clone` (template-mode optional)
+- `qm migrate` dry-run (single-node, so no real migrate)
 
-The images are for API-surface testing — request shape, response
-parsing, auth flow, error envelopes, pagination. Workload operations
-deliberately fail.
+What still doesn't work:
+
+- Live migration (single node)
+- VM operations that need a real OS in the guest (cloud-init, qemu
+  guest-agent, snapshot RAM)
+- Workloads that need real disk I/O at scale
+
+For those: mock the endpoints, run against a real cluster, or
+skip-tag the tests.
 
 ## PMG returns `(unsupported-by-pmg)` for token_value
 

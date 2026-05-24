@@ -12,13 +12,15 @@
 
 ## Non-goals
 
-- Run actual VMs, containers, or backups. The kernel inside an Actions
-  runner doesn't have a usable KVM, and even if it did, the storage layer
-  isn't pre-seeded with templates. Tests should mock or skip workload
-  endpoints.
 - Run a multi-node cluster. Each container is single-node.
 - Production hardening. The credentials are public, the certs are
   self-signed, and the API is reachable on all interfaces.
+- Live migration, real cluster operations, real backups against
+  long-lived datastores, mail filtering against a real MTA.
+- Real-OS guests. The fixture VM is a 256-byte boot sector and the
+  fixture CT is an Alpine minirootfs — enough for the lifecycle
+  endpoints to be testable end-to-end, not enough for cloud-init,
+  guest agents, or workload simulation.
 
 ## Per-product structure
 
@@ -138,3 +140,61 @@ GPG key, same suite, same component pattern.
 If a future PVE version drops Trixie, this repo's CI will break loudly
 (apt resolution failure) rather than silently building images against
 EOL packages.
+
+## Fixture VMs and containers
+
+The PVE image ships two pre-seeded workloads so SDK tests can exercise
+the lifecycle endpoints (`start`, `stop`, `shutdown`, `exec`) against
+real running guests, not just configuration CRUD.
+
+| vmid | Kind | Source                                                    | Host needs        |
+|------|------|-----------------------------------------------------------|-------------------|
+| 100  | VM   | [256-byte-vm](https://github.com/client-api/256-byte-vm) v1.0.0 (1 MiB SeaBIOS-bootable qcow2) | `/dev/kvm`        |
+| 200  | CT   | Alpine 3.21 minirootfs                                    | cgroup v2 host    |
+
+Both are downloaded at image-build time from upstream releases and
+SHA-256-verified against pinned hashes. The boot script (`pve/
+entrypoint.sh`) seeds the PVE config files for each on every boot —
+re-using existing disk images if they already exist, so restart
+cycles preserve guest state.
+
+### Why systemd in PVE, why not in PBS/PMG/PDM
+
+The PVE image runs systemd as PID 1 because `qm start` and `pct start`
+both reach `systemd1` over dbus (`PVE::Systemd::enter_systemd_scope`)
+to place the QEMU / lxc-start process in a transient cgroup scope.
+Without a real systemd, that dbus call fails with `Spawn.ChildExited`
+and the workload never launches.
+
+PBS, PMG, and PDM have no equivalent path — their daemons are
+content to run as plain forked children. Adding systemd to those
+images would cost 5-10 s of boot time and force us to mask the
+container-hostile units (`systemd-networkd-wait-online`, `chrony`,
+`watchdog-mux`, etc.) without buying anything testable.
+
+### Why lxcfs needs an override
+
+`/usr/share/lxc/config/common.conf.d/00-lxcfs.conf` wires lxcfs into
+the LXC config chain as `lxc.hook.mount = /usr/share/lxcfs/lxc.mount.
+hook`. Every `pct start` runs that hook, which expects lxcfs's FUSE
+pseudo-fs mounted at `/var/lib/lxcfs`.
+
+But upstream's `lxcfs.service` has `ConditionVirtualization=!container`
+— a sensible default on a real PVE host (you don't run a virtualising
+pseudo-fs inside a container that has nothing to virtualise), but it
+means our test image never starts lxcfs unless we override the
+condition. The drop-in at `/etc/systemd/system/lxcfs.service.d/
+override.conf` clears it.
+
+### Why CT 200 gets AppArmor disabled
+
+PVE auto-generates an AppArmor profile per container and tries to
+load it via `apparmor_parser` at every start. Inside a privileged
+Docker container the kernel rejects profile-load syscalls from a
+non-host namespace — there's no Docker-in-Docker AppArmor namespace
+path.
+
+We append `lxc.apparmor.profile: unconfined` to the seed CT config
+so LXC skips the profile load entirely. The remaining isolation
+(cgroups, seccomp, capabilities) is unchanged; the outer Docker
+`--privileged` is the actual security boundary anyway.
