@@ -140,6 +140,15 @@ COPY pve/systemd/proxmox-docker-boot.service \
      /etc/systemd/system/proxmox-docker-boot.service
 RUN systemctl enable proxmox-docker-hostname.service proxmox-docker-boot.service
 
+# Without this drop-in, lxcfs.service refuses to start
+# (`ConditionVirtualization=!container`), `pct start` then fails with
+# `lxc_setup: Failed to run mount hooks` because PVE's LXC config
+# pins `lxc.hook.mount = /usr/share/lxcfs/lxc.mount.hook` via
+# common.conf.d/00-lxcfs.conf.
+RUN install -d /etc/systemd/system/lxcfs.service.d
+COPY pve/systemd/lxcfs-override.conf \
+     /etc/systemd/system/lxcfs.service.d/override.conf
+
 COPY scripts/common-entrypoint.sh /usr/local/lib/proxmox-common.sh
 COPY pve/proxmox-docker-hostname.sh /usr/local/sbin/proxmox-docker-hostname.sh
 COPY pve/entrypoint.sh /usr/local/sbin/proxmox-docker-boot.sh

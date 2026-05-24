@@ -63,17 +63,33 @@ jobs:
           platforms: linux/amd64
           cache-from: type=gha,scope=${{ matrix.product }}
 
+      - name: Enable KVM device permissions
+        # ubuntu-latest runners ship the kvm kernel module + /dev/kvm
+        # since GitHub's April 2024 nested-virt rollout, but the device
+        # is owned root:kvm 0660 and the runner user isn't in the kvm
+        # group. The udev rule below is the pattern documented at
+        # https://github.blog/changelog/2024-04-02-github-actions-hardware-accelerated-android-virtualization-now-available/
+        # — it sets 0666 + a static_node hint so the file survives
+        # subsystem re-probes.
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+
       - name: Detect /dev/kvm on runner
         id: kvm
         run: |
-          if [ -e /dev/kvm ] && [ -r /dev/kvm ]; then
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
             echo "device_arg=--device /dev/kvm" >> "$GITHUB_OUTPUT"
-            echo "KVM available on runner"
+            echo "KVM available on runner ($(ls -la /dev/kvm))"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "device_arg=" >> "$GITHUB_OUTPUT"
-            echo "KVM not present — VM lifecycle step will be skipped"
+            echo "KVM device missing — VM lifecycle step will be skipped"
           fi
 
       - name: Detect cgroup v2 on runner
