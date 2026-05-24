@@ -171,11 +171,25 @@ seed_fixture_ct() {
         --ostype alpine \
         --unprivileged 0 \
         --features nesting=1 \
-        --description "proxmox-docker fixture container — see https://github.com/client-api/proxmox-docker" \
+        --description "proxmox-docker fixture container - https://github.com/client-api/proxmox-docker" \
         2>&1 || {
             log "WARNING: pct create failed; CT lifecycle will be unavailable"
             return 0
         }
+
+    # PVE generates an AppArmor profile per container and tries to
+    # load it via `apparmor_parser`. Inside a Docker container even
+    # with --privileged the kernel's apparmor interface refuses
+    # profile-load syscalls from a non-host namespace, so LXC bails
+    # with `Failed to load generated AppArmor profile`. Telling LXC
+    # to run unconfined sidesteps the load entirely. We keep the
+    # rest of PVE's safety surface in place (cgroups, seccomp, the
+    # outer Docker --privileged is the security boundary anyway).
+    local ct_conf="/etc/pve/lxc/${FIXTURE_CTID}.conf"
+    if ! grep -q '^lxc.apparmor.profile' "$ct_conf" 2>/dev/null; then
+        log "disabling AppArmor for CT ${FIXTURE_CTID} (Docker-in-Docker constraint)"
+        echo 'lxc.apparmor.profile: unconfined' >> "$ct_conf"
+    fi
 }
 
 # Stage the 256-byte-vm fixture as VM 100. Idempotent across boots —
