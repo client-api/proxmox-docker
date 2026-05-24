@@ -1,0 +1,27 @@
+[Unit]
+Description=proxmox-docker boot orchestration (vmbr0 stub, credential + fixture seed)
+Documentation=https://github.com/client-api/proxmox-docker
+# Must run after pmxcfs (provided by pve-cluster.service) so /etc/pve
+# is mounted and we can write VM configs into it. Must run after the
+# management API is up so `pveum` calls go through and the seed-
+# credentials step lands in the same auth store the SDK tests query.
+After=pve-cluster.service pvedaemon.service pveproxy.service
+Wants=pve-cluster.service pvedaemon.service pveproxy.service
+# Block multi-user.target until the seed finishes — that's the gate
+# Docker's HEALTHCHECK polls against.
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/proxmox-docker-boot.sh
+# The seed retries internally; once it returns the container should be
+# answer-ready. Don't restart on failure — failing loudly is the right
+# behaviour for a CI fixture.
+Restart=no
+TimeoutStartSec=120s
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

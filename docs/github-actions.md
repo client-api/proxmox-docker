@@ -19,11 +19,15 @@ jobs:
         options: >-
           --privileged
           --device /dev/fuse
-          --health-cmd "curl -ksf -o /dev/null https://localhost:8006/api2/json/version && test -s /run/credentials.json"
+          --device /dev/kvm
+          --tmpfs /tmp
+          --tmpfs /run
+          --tmpfs /run/lock
+          --health-cmd "/usr/local/sbin/healthcheck.sh"
           --health-interval 5s
           --health-retries 30
           --health-timeout 5s
-          --health-start-period 30s
+          --health-start-period 60s
         ports:
           - 8006:8006
 
@@ -76,9 +80,13 @@ jobs:
         options: >-
           --privileged
           --device /dev/fuse
-          --health-cmd "curl -ksf -o /dev/null https://localhost:${{ matrix.port }}${{ matrix.health_path }} && test -s /run/credentials.json"
+          --tmpfs /tmp
+          --tmpfs /run
+          --tmpfs /run/lock
+          --health-cmd "/usr/local/sbin/healthcheck.sh"
           --health-interval 5s
           --health-retries 30
+          --health-start-period 60s
         ports:
           - ${{ matrix.port }}:${{ matrix.port }}
 
@@ -100,25 +108,44 @@ upper-cased variable (e.g. `URL`, `USER`, `PASSWORD`, `TOKEN_ID`, `TOKEN_VALUE`,
 
 ## Why `--privileged`?
 
-PVE and PMG both mount their config directories via FUSE (`pmxcfs`). Inside
-GitHub Actions runners, that mount requires:
+The PVE and PMG images need it for two reasons:
 
-- the `SYS_ADMIN` capability (Linux requirement for non-root FUSE)
-- a writable `/dev/fuse`
-- an unmasked `/sys` (Docker masks parts of `/sys` by default)
+- pmxcfs is a FUSE mount — needs `SYS_ADMIN` capability and a writable
+  `/dev/fuse`
+- The PVE image runs systemd as PID 1 (so `qm start` can place QEMU in
+  a transient systemd scope), and systemd needs writable cgroup
+  hierarchies inside the container.
 
-The simplest way to get all three is `--privileged`. You can theoretically
-unprivilege the container with:
+The simplest way to get both is `--privileged`. PBS and PDM don't use
+pmxcfs or systemd; they only need privileged mode for symmetry with
+PVE/PMG in matrix jobs.
 
+## VM lifecycle in PVE (`--device /dev/kvm`)
+
+The PVE image ships a 1 MiB SeaBIOS-bootable fixture VM at vmid 100
+(`tiny-test`, sourced from the
+[256-byte-vm](https://github.com/client-api/256-byte-vm) release).
+If the runner has `/dev/kvm` and you pass it through with
+`--device /dev/kvm`, the full `qm start` / `qm shutdown` / `qm stop`
+cycle works against this VM.
+
+`ubuntu-latest` runners have had nested KVM since 2024-06; older
+self-hosted runners or non-Azure providers may not. Detect at runtime:
+
+```yaml
+- name: Detect /dev/kvm
+  id: kvm
+  run: |
+    if [ -e /dev/kvm ]; then
+      echo "device_arg=--device /dev/kvm" >> "$GITHUB_OUTPUT"
+    else
+      echo "device_arg=" >> "$GITHUB_OUTPUT"
+    fi
 ```
---cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined
-```
 
-…but in practice GitHub-hosted runners enforce enough additional restrictions
-that the unprivileged path is unreliable. **Use `--privileged`.**
-
-PBS and PDM don't use pmxcfs, so they don't strictly need privileged mode —
-but using it uniformly keeps the workflow matrix simple.
+Without `/dev/kvm`, every config-level VM endpoint still works
+(create, list, get, snapshot config, clone config, …). Only the
+`start` operation hard-fails.
 
 ## Network considerations
 

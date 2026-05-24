@@ -1,15 +1,20 @@
 #!/bin/bash
 #
-# Proxmox VE test-image entrypoint.
+# proxmox-docker post-boot orchestration for the PVE image.
 #
-# Boot sequence:
-#   1. Configure hostname/FQDN/hosts so PVE sees itself as a real node
-#   2. Mount /etc/pve via pmxcfs in standalone (local) mode
-#   3. Generate self-signed certs via pvecm updatecerts
-#   4. Start pvedaemon, pvestatd, pveproxy
-#   5. Wait for the API to answer on :8006
-#   6. Seed root@pam password + create the E2E API token
-#   7. Tail logs to keep PID 1 alive
+# Invoked by the `proxmox-docker-boot.service` systemd unit, NOT as
+# the container's PID 1. By the time we run, pmxcfs has mounted /etc/pve
+# and pvedaemon/pveproxy are listening on :8006. Our job is:
+#
+#   1. Bring up a `vmbr0` Linux bridge so qemu-server can validate the
+#      net0 stanza in VM configs.
+#   2. Seed the root@pam password + the E2E API token.
+#   3. Stage the 256-byte-vm fixture (vmid 100, "tiny-test") so
+#      lifecycle smoke tests have something real to start/stop.
+#
+# Everything is idempotent — re-running the unit on container restart
+# updates the password and refreshes the token without recreating the
+# fixture disk.
 
 set -euo pipefail
 
@@ -17,57 +22,43 @@ LOG_PREFIX=pve
 # shellcheck source=../scripts/common-entrypoint.sh
 source /usr/local/lib/proxmox-common.sh
 
-: "${PVE_HOSTNAME:=pve-test}"
-: "${PVE_FQDN:=pve-test.local}"
 : "${PVE_ROOT_PASSWORD:=proxmox123}"
 : "${PVE_API_TOKEN_NAME:=test}"
+: "${PVE_SEED_FIXTURE_VM:=1}"
 
-start_pmxcfs() {
-    log "starting pmxcfs in local mode"
-    mkdir -p /var/lib/pve-cluster /etc/pve
+readonly FIXTURE_VMID=100
+readonly FIXTURE_NAME=tiny-test
+readonly FIXTURE_SRC=/usr/local/share/proxmox-docker/boot.qcow2
 
-    # -l (local) → run without corosync; we only need /etc/pve mounted
-    # so the rest of PVE can read its config.
-    pmxcfs -l &
-    CHILD_PIDS+=($!)
-
-    local i
-    for i in $(seq 1 30); do
-        if mountpoint -q /etc/pve; then
-            log "pmxcfs mounted (/etc/pve)"
-            return 0
-        fi
-        sleep 1
-    done
-    log "ERROR: pmxcfs failed to mount /etc/pve within 30s"
-    log "hint: container needs --privileged (or --cap-add SYS_ADMIN --device /dev/fuse)"
-    exit 1
+ensure_vmbr0() {
+    # qemu-server validates that the bridge in net0 actually exists on
+    # the host. On a real PVE install ifupdown brings up vmbr0 from
+    # /etc/network/interfaces. In a container we create a Linux bridge
+    # by hand — traffic has nowhere to go, the bridge only needs to
+    # exist so config validation passes.
+    if ip link show vmbr0 >/dev/null 2>&1; then
+        log "vmbr0 already present"
+        return 0
+    fi
+    log "creating vmbr0 stub bridge"
+    ip link add vmbr0 type bridge
+    ip link set vmbr0 up
 }
 
-generate_certs() {
-    log "generating PVE certificates"
-    # Updatecerts is idempotent and runs on every boot — it'll reuse the
-    # CA when one already exists. We don't fail the boot if it returns
-    # non-zero because a missing /etc/pve/priv on first boot can trigger
-    # one spurious "not a directory" warning.
-    pvecm updatecerts --force 2>&1 || true
-}
-
-start_daemons() {
-    log "starting pvedaemon"
-    pvedaemon start
-    log "starting pvestatd"
-    pvestatd start
-    log "starting pveproxy"
-    pveproxy start
+wait_for_api() {
+    # systemd starts pvedaemon and pveproxy in parallel with us. The
+    # ordering directives nudge them ahead, but the API socket can
+    # still take a beat to start accepting connections — give it up
+    # to 30s.
+    wait_for_https "https://localhost:8006/api2/json/version" 30
 }
 
 seed_credentials() {
     log "setting root@pam password"
     echo "root:${PVE_ROOT_PASSWORD}" | chpasswd
 
-    # Remove any token left over from a previous boot so the create
-    # below is deterministic.
+    # Drop any token from a previous boot so the new one is the only
+    # value in /run/credentials.json.
     pveum user token remove "root@pam" "${PVE_API_TOKEN_NAME}" \
         --output-format json 2>/dev/null || true
 
@@ -85,7 +76,7 @@ seed_credentials() {
     fi
 
     write_credentials \
-        "${PVE_HOSTNAME}" \
+        "$(hostname)" \
         "8006" \
         "root@pam" \
         "${PVE_ROOT_PASSWORD}" \
@@ -93,28 +84,87 @@ seed_credentials() {
         "${token_value}"
 }
 
+# Ensure PVE's default `local` directory storage advertises `images`
+# alongside the iso/vztmpl/backup content types it ships with. Without
+# `images` in its content list, qemu-server refuses to allocate the
+# fixture disk under it.
+configure_local_storage() {
+    local cfg=/etc/pve/storage.cfg
+    if [ ! -s "$cfg" ]; then
+        log "writing default storage.cfg"
+        cat > "$cfg" <<'EOF'
+dir: local
+	path /var/lib/vz
+	content images,iso,vztmpl,backup,snippets,rootdir
+	shared 0
+EOF
+        return
+    fi
+    if ! grep -qE '^\s*content.*\bimages\b' "$cfg"; then
+        log "extending local storage with images content type"
+        sed -i -E 's/^(\s*content\s+)(.*)$/\1images,\2/' "$cfg"
+    fi
+}
+
+# Stage the 256-byte-vm fixture as VM 100. Idempotent across boots —
+# if the disk + config already exist, leave them in place.
+seed_fixture_vm() {
+    if [ "${PVE_SEED_FIXTURE_VM}" != "1" ]; then
+        log "fixture VM seeding disabled (PVE_SEED_FIXTURE_VM=$PVE_SEED_FIXTURE_VM)"
+        return 0
+    fi
+    if [ ! -s "$FIXTURE_SRC" ]; then
+        log "WARNING: $FIXTURE_SRC missing — skipping fixture VM seed"
+        return 0
+    fi
+
+    local disk_dir="/var/lib/vz/images/${FIXTURE_VMID}"
+    local disk_path="${disk_dir}/vm-${FIXTURE_VMID}-disk-0.qcow2"
+    local vm_conf="/etc/pve/qemu-server/${FIXTURE_VMID}.conf"
+
+    install -d "$disk_dir"
+    if [ ! -s "$disk_path" ]; then
+        log "copying fixture disk to ${disk_path}"
+        install -m 0640 "$FIXTURE_SRC" "$disk_path"
+    fi
+
+    if [ ! -s "$vm_conf" ]; then
+        log "writing VM ${FIXTURE_VMID} (${FIXTURE_NAME}) config"
+        # 64 MiB RAM, 1 vCPU, SeaBIOS, no guest agent. The guest's ACPI
+        # power-button handler answers `qm shutdown` cleanly so tests
+        # don't wait out the 3-minute force-kill timeout.
+        cat > "$vm_conf" <<EOF
+boot: order=scsi0
+bios: seabios
+cores: 1
+memory: 64
+name: ${FIXTURE_NAME}
+net0: virtio,bridge=vmbr0
+ostype: other
+scsi0: local:${FIXTURE_VMID}/vm-${FIXTURE_VMID}-disk-0.qcow2,size=1M
+scsihw: virtio-scsi-single
+serial0: socket
+vga: serial0
+agent: 0
+EOF
+    fi
+}
+
 main() {
     print_test_only_banner
-    ensure_hostname "$PVE_HOSTNAME" "$PVE_FQDN"
-    start_pmxcfs
-    generate_certs
-    start_daemons
-
-    wait_for_https "https://localhost:8006/api2/json/version" 60 || exit 1
+    ensure_vmbr0
+    wait_for_api || exit 1
     seed_credentials
+    configure_local_storage
+    seed_fixture_vm
 
-    log "PVE test container ready on https://${PVE_HOSTNAME}:8006"
+    log "PVE test container ready on https://$(hostname):8006"
     log "  user:     root@pam"
     log "  password: ${PVE_ROOT_PASSWORD}"
     log "  token:    /run/credentials.json"
-
-    # Keep PID 1 alive. Log files are tailed for observability; the
-    # SIGTERM trap handles graceful shutdown.
-    touch /var/log/pveproxy/access.log 2>/dev/null || true
-    exec tail --pid=$$ -F \
-        /var/log/pveproxy/access.log \
-        /var/log/daemon.log 2>/dev/null \
-        || sleep infinity
+    if [ "${PVE_SEED_FIXTURE_VM}" = "1" ] && [ -s "$FIXTURE_SRC" ]; then
+        log "  fixture:  VM ${FIXTURE_VMID} (${FIXTURE_NAME}) — try \`qm start ${FIXTURE_VMID}\` if /dev/kvm is available"
+    fi
 }
 
 main "$@"

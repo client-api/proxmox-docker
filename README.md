@@ -46,11 +46,34 @@ test code can read `token_header_value` directly without branching on product.
 
 ### What does NOT work in these images
 
-- VM and LXC lifecycle (no KVM/LXC available inside a container)
-- Real backups against a backing datastore (PBS spins up but datastore I/O is limited)
+- LXC container lifecycle (PVE's LXC stack expects to own the cgroup
+  hierarchy directly, which Docker doesn't let it do)
+- Real backups against a backing datastore (PBS spins up but datastore
+  I/O is limited)
 - Mail filtering (PMG; no real Postfix backend)
 - Cross-node cluster operations (single-node only)
-- API-token auth against PMG (the API surface itself doesn't expose tokens)
+- API-token auth against PMG (the API surface itself doesn't expose
+  tokens)
+
+### Bonus: working KVM lifecycle in PVE
+
+The PVE image runs systemd as PID 1 and ships a 1 MiB SeaBIOS-bootable
+**fixture VM at vmid 100** (`tiny-test`), backed by the
+[256-byte-vm](https://github.com/client-api/256-byte-vm) release asset.
+If you pass `--device /dev/kvm` to `docker run` and the host has KVM,
+the full lifecycle works:
+
+```bash
+docker exec pve-test qm start 100         # VM boots in <1 s
+docker exec pve-test qm shutdown 100      # ACPI handler exits cleanly
+docker exec pve-test qm stop 100          # hard kill
+docker exec pve-test qm list              # confirm status
+```
+
+This lets SDK tests exercise the start/stop/migrate-prep/snapshot
+endpoints against a real running VM, not just config-level CRUD.
+Without `/dev/kvm` the config endpoints still work — `qm start` is the
+only operation that hard-fails.
 
 This is intentional. The images exist to let SDK client tests exercise the API
 layer — request shape, response parsing, auth, pagination, error envelopes —
@@ -63,6 +86,8 @@ docker run -d --rm \
     --name pve-test \
     --privileged \
     --device /dev/fuse \
+    --device /dev/kvm \
+    --tmpfs /tmp --tmpfs /run --tmpfs /run/lock \
     -p 8006:8006 \
     ghcr.io/client-api/proxmox-docker/pve-test:latest
 
@@ -74,10 +99,14 @@ curl -k -d 'username=root@pam&password=proxmox123' \
     https://localhost:8006/api2/json/access/ticket
 ```
 
-`--privileged` is required because Proxmox's cluster filesystem (`pmxcfs`)
-is a FUSE mount, and several daemons expect to be able to chown across uids.
-`--device /dev/fuse` alone is insufficient — `pmxcfs` also needs the SYS_ADMIN
-capability and an unmasked `/sys`.
+`--privileged` is required for two reasons:
+- Proxmox's cluster filesystem (`pmxcfs`) is a FUSE mount.
+- The PVE image runs systemd as PID 1, which needs cgroup access.
+
+`--device /dev/kvm` enables real VM lifecycle (see "Bonus" below).
+Omit it if the host lacks KVM — the rest of the API still works.
+The three `--tmpfs` mounts are systemd's normal expectations for
+`/tmp`, `/run`, `/run/lock` inside a container.
 
 ## Baked-in credentials
 
@@ -135,10 +164,15 @@ jobs:
         options: >-
           --privileged
           --device /dev/fuse
-          --health-cmd "curl -ks https://localhost:8006/api2/json/version || exit 1"
+          --device /dev/kvm
+          --tmpfs /tmp
+          --tmpfs /run
+          --tmpfs /run/lock
+          --health-cmd "/usr/local/sbin/healthcheck.sh"
           --health-interval 5s
           --health-retries 30
           --health-timeout 5s
+          --health-start-period 60s
         ports:
           - 8006:8006
     steps:

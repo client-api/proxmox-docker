@@ -63,12 +63,27 @@ jobs:
           platforms: linux/amd64
           cache-from: type=gha,scope=${{ matrix.product }}
 
+      - name: Detect /dev/kvm on runner
+        id: kvm
+        run: |
+          if [ -e /dev/kvm ] && [ -r /dev/kvm ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "device_arg=--device /dev/kvm" >> "$GITHUB_OUTPUT"
+            echo "KVM available on runner"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "device_arg=" >> "$GITHUB_OUTPUT"
+            echo "KVM not present — VM lifecycle step will be skipped"
+          fi
+
       - name: Start container
         run: |
           docker run -d --rm \
             --name ${{ matrix.product }}-test \
             --privileged \
             --device /dev/fuse \
+            ${{ steps.kvm.outputs.device_arg }} \
+            --tmpfs /tmp --tmpfs /run --tmpfs /run/lock \
             -p ${{ matrix.port }}:${{ matrix.port }} \
             ${{ matrix.product }}-test:smoke
 
@@ -117,6 +132,39 @@ jobs:
             -H "Authorization: ${token_id}=${token_value}" \
             "https://localhost:${{ matrix.port }}${{ matrix.health_path }}" \
             | jq .
+
+      - name: Verify VM lifecycle (PVE only, needs /dev/kvm)
+        if: matrix.product == 'pve' && steps.kvm.outputs.available == 'true'
+        run: |
+          # The PVE image bakes a 1 MiB SeaBIOS-bootable fixture VM at
+          # vmid 100 ("tiny-test"), backed by the 256-byte-vm release
+          # asset. Exercise the full start → graceful-shutdown →
+          # start → hard-stop cycle to prove qm itself plus the dbus
+          # path into systemd-managed cgroups work end-to-end.
+          docker exec pve-test qm status 100
+          docker exec pve-test qm start 100
+          sleep 3
+          status=$(docker exec pve-test qm status 100 | awk '{print $2}')
+          [ "$status" = "running" ] || { echo "::error::VM didn't start; status=$status"; exit 1; }
+          # The fixture guest installs an ACPI power-button handler so
+          # `qm shutdown` exits cleanly to S5 without the 3-minute kill
+          # timeout. We allow 30s and verify the VM stopped on its own.
+          docker exec pve-test timeout 30 qm shutdown 100
+          status=$(docker exec pve-test qm status 100 | awk '{print $2}')
+          [ "$status" = "stopped" ] || { echo "::error::ACPI shutdown failed; status=$status"; exit 1; }
+          # Final round-trip: restart, hard kill, confirm stopped.
+          docker exec pve-test qm start 100
+          sleep 3
+          docker exec pve-test qm stop 100
+          status=$(docker exec pve-test qm status 100 | awk '{print $2}')
+          [ "$status" = "stopped" ] || { echo "::error::qm stop failed; status=$status"; exit 1; }
+          echo "VM lifecycle ok"
+
+      - name: Skip VM lifecycle (no KVM on runner)
+        if: matrix.product == 'pve' && steps.kvm.outputs.available != 'true'
+        run: |
+          echo "::warning::/dev/kvm not present — VM start/stop lifecycle was not validated. \
+          Use a runner with nested virtualization (e.g. GitHub larger runners with -kvm SKUs)."
 
       - name: Verify password-based ticket auth works (PVE/PMG only)
         if: matrix.product == 'pve' || matrix.product == 'pmg'

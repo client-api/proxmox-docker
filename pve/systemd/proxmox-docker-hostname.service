@@ -1,0 +1,20 @@
+[Unit]
+Description=Set hostname + /etc/hosts before pmxcfs starts
+Documentation=https://github.com/client-api/proxmox-docker
+# pmxcfs refuses to start if the local hostname doesn't resolve to a
+# non-127.0.0.1 address. Docker's bind-mounted /etc/hosts comes with
+# the container ID as hostname by default — we override it with
+# pve-test (configurable via the PVE_HOSTNAME env var).
+DefaultDependencies=no
+Before=pve-cluster.service network.target sysinit.target
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/proxmox-docker-hostname.sh
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=sysinit.target

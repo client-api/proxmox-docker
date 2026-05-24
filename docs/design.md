@@ -62,21 +62,35 @@ The same pattern applies to PBS (skip `proxmox-backup-server` meta in
 favor of `proxmox-backup`), PMG (skip `proxmox-mailgateway`), and PDM
 (skip `proxmox-datacenter-manager-meta`).
 
-## Why no systemd?
+## Systemd in PVE; bash entrypoints elsewhere
 
-systemd inside a container is possible but expensive: it wants `/sys/fs/cgroup`
-mounted writable, dedicated cgroup namespaces, and either privileged mode or
-careful capability hand-tuning. It also adds 10–20s to the cold start while
-units settle.
+The PVE image runs systemd as PID 1 (`/lib/systemd/systemd`). PBS, PMG,
+and PDM use the older minimal-bash entrypoint pattern.
 
-We run each product's daemons directly from the entrypoint. Proxmox makes
-this easy — every daemon binary either supports a `start` subcommand
-(`pvedaemon start`) or runs in the foreground by default (PBS/PDM Rust
-binaries).
+The split exists because **`qm start` reaches systemd1 over dbus to
+place the QEMU process in a transient cgroup scope** (see
+`PVE::Systemd::enter_systemd_scope`). Without an actual systemd
+running, that call returns `Spawn.ChildExited` and the VM never
+launches. PBS/PMG/PDM don't have an equivalent path — their daemons
+are happy to run as plain forked children.
 
-The trade-off: no service restart on crash. For a test-only image that's
-acceptable — if a daemon crashes mid-test, the test should fail loudly
-rather than silently re-running against a restarted backend.
+Why not standardise on systemd everywhere:
+
+- PBS and PDM only need two Rust daemons launched; bringing up the
+  full sysinit/multi-user target chain just for that costs 5–10 s of
+  boot time and adds masking work to keep `systemd-networkd-wait-
+  online` etc. quiet.
+- PMG's daemons are Perl scripts that run cleanly in the foreground
+  via `pmgdaemon start`; same calculation as PBS/PDM.
+- The minimal-bash entrypoint is easier to read and to reason about
+  when something breaks at boot.
+
+The PVE entrypoint script (`pve/entrypoint.sh`) survives — but as the
+ExecStart of `proxmox-docker-boot.service`, not as PID 1. It runs once
+after `pve-cluster.service` is up, seeds credentials and the fixture
+VM, and exits. Hostname setup happens in a separate `proxmox-docker-
+hostname.service` ordered `Before=pve-cluster.service` so pmxcfs has a
+valid FQDN to bind to.
 
 ## Why FUSE (`pmxcfs`)?
 
