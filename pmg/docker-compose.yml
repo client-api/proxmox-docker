@@ -1,0 +1,45 @@
+# Proxmox Mail Gateway — test-only Docker Compose setup.
+#
+# Boots the PMG API on https://localhost:8016. The host port is
+# remapped from PMG's native 8006 because PVE uses the same port —
+# pick one or the other if you run both on the same host. Edit the
+# `ports:` entry below to use 8006 if you don't have that conflict.
+#
+#     docker compose -f pmg/docker-compose.yml up -d
+#     curl -k -d 'username=root@pam&password=proxmox123' \
+#         https://localhost:8016/api2/json/access/ticket
+#
+# PMG only supports ticket-based auth; the /access subtree has no
+# /users/<id>/token endpoint. The credentials JSON writes
+# `token_value: "(unsupported-by-pmg)"` so SDK code can skip-tag the
+# token-auth test against this product.
+#
+# NOT FOR PRODUCTION USE. Hard-coded credentials, self-signed TLS,
+# --privileged runtime. See ../README.md for the full warning.
+
+services:
+  pmg:
+    image: ${PMG_IMAGE:-ghcr.io/client-api/proxmox-docker/pmg-test:9}
+    container_name: pmg-test
+    hostname: pmg-test
+    # PMG starts PostgreSQL + pmgdaemon + pmgproxy as plain daemons.
+    # No FUSE, no systemd PID 1, but --privileged keeps it symmetric
+    # with the other products and gives PostgreSQL its expected
+    # capabilities.
+    privileged: true
+    # PMG natively runs on :8006 (same as PVE). Remapped to 8016 so
+    # both can share a host. Change to "8006:8006" if PMG is the only
+    # Proxmox product you're running.
+    ports:
+      - "8016:8006"
+    healthcheck:
+      test: ["CMD", "/usr/local/sbin/healthcheck.sh"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    environment:
+      PMG_HOSTNAME: pmg-test
+      PMG_FQDN: pmg-test.local
+      PMG_ROOT_PASSWORD: proxmox123
+      PMG_API_TOKEN_NAME: test

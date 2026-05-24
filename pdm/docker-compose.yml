@@ -1,0 +1,40 @@
+# Proxmox Datacenter Manager — test-only Docker Compose setup.
+#
+# Boots the PDM API on https://localhost:8443. PDM is the smallest of
+# the four images (~250 MB) and cold-starts in 4-8 s.
+#
+#     docker compose -f pdm/docker-compose.yml up -d
+#     curl -k -d 'username=root@pam&password=proxmox123' \
+#         https://localhost:8443/api2/extjs/access/ticket
+#
+# PDM uses the extjs API base path (/api2/extjs/...), unlike the
+# other three products which use /api2/json/.... Token auth uses the
+# colon separator (Rust-family product) — read `token_header_value`
+# from /run/credentials.json.
+#
+# NOT FOR PRODUCTION USE. Hard-coded credentials, self-signed TLS,
+# --privileged runtime. See ../README.md for the full warning.
+
+services:
+  pdm:
+    image: ${PDM_IMAGE:-ghcr.io/client-api/proxmox-docker/pdm-test:1.0}
+    container_name: pdm-test
+    hostname: pdm-test
+    # PDM's privileged-api setup is strict about ownership + mode on
+    # /etc/proxmox-datacenter-manager (must be 01770 root-group:
+    # www-data). The entrypoint chowns this itself, but the chown
+    # needs CAP_CHOWN against the bind-mount, hence --privileged.
+    privileged: true
+    ports:
+      - "8443:8443"
+    healthcheck:
+      test: ["CMD", "/usr/local/sbin/healthcheck.sh"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    environment:
+      PDM_HOSTNAME: pdm-test
+      PDM_FQDN: pdm-test.local
+      PDM_ROOT_PASSWORD: proxmox123
+      PDM_API_TOKEN_NAME: test

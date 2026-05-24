@@ -94,6 +94,25 @@ not to actually run workloads.
 
 ## Quick start (local)
 
+Each product directory ships a self-contained `docker-compose.yml` —
+the easiest way to spin up one product locally:
+
+```bash
+docker compose -f pve/docker-compose.yml up -d   # PVE on :8006
+docker compose -f pbs/docker-compose.yml up -d   # PBS on :8007
+docker compose -f pmg/docker-compose.yml up -d   # PMG on :8016 (remapped from :8006 to avoid PVE clash)
+docker compose -f pdm/docker-compose.yml up -d   # PDM on :8443
+```
+
+Override the image tag without editing the file:
+
+```bash
+PVE_IMAGE=ghcr.io/client-api/proxmox-docker/pve-test:9.2.2 \
+    docker compose -f pve/docker-compose.yml up -d
+```
+
+The plain `docker run` equivalent:
+
 ```bash
 docker run -d --rm \
     --name pve-test \
@@ -206,10 +225,10 @@ products in parallel.
 
 ```
 proxmox-docker/
-├── pve/                Dockerfile + entrypoint for Proxmox VE
-├── pbs/                Dockerfile + entrypoint for Proxmox Backup Server
-├── pmg/                Dockerfile + entrypoint for Proxmox Mail Gateway
-├── pdm/                Dockerfile + entrypoint for Proxmox Datacenter Manager
+├── pve/                Dockerfile, entrypoint, systemd units, docker-compose.yml for Proxmox VE
+├── pbs/                Dockerfile, entrypoint, docker-compose.yml for Proxmox Backup Server
+├── pmg/                Dockerfile, entrypoint, docker-compose.yml for Proxmox Mail Gateway
+├── pdm/                Dockerfile, entrypoint, docker-compose.yml for Proxmox Datacenter Manager
 ├── scripts/            Shared helper scripts (repo setup, credential seeding)
 ├── docs/               Design notes, GHA integration guide, troubleshooting
 └── .github/workflows/  Build/publish + smoke-test pipelines

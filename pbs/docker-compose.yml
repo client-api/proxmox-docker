@@ -1,0 +1,40 @@
+# Proxmox Backup Server — test-only Docker Compose setup.
+#
+# Boots the PBS API on https://localhost:8007. The image runs the
+# two PBS daemons directly (no systemd PID 1 — PBS doesn't need a
+# transient cgroup scope the way PVE does), so cold-start is fast
+# (~6-12 s).
+#
+#     docker compose -f pbs/docker-compose.yml up -d
+#     curl -k https://localhost:8007/api2/json/version
+#
+# Token auth uses the colon separator (Rust-family product), e.g.
+# `PBSAPIToken=root@pam!test:<uuid>`. Read `token_header_value` from
+# /run/credentials.json inside the container — never assemble the
+# header by hand.
+#
+# NOT FOR PRODUCTION USE. Hard-coded credentials, self-signed TLS,
+# --privileged runtime. See ../README.md for the full warning.
+
+services:
+  pbs:
+    image: ${PBS_IMAGE:-ghcr.io/client-api/proxmox-docker/pbs-test:4.2}
+    container_name: pbs-test
+    hostname: pbs-test
+    # PBS doesn't use pmxcfs but its TrafficControlCache mmaps a file
+    # under /run/proxmox-backup that has to be on tmpfs. The entrypoint
+    # mounts it itself — that needs SYS_ADMIN, hence --privileged.
+    privileged: true
+    ports:
+      - "8007:8007"
+    healthcheck:
+      test: ["CMD", "/usr/local/sbin/healthcheck.sh"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    environment:
+      PBS_HOSTNAME: pbs-test
+      PBS_FQDN: pbs-test.local
+      PBS_ROOT_PASSWORD: proxmox123
+      PBS_API_TOKEN_NAME: test

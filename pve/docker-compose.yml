@@ -1,0 +1,62 @@
+# Proxmox VE — test-only Docker Compose setup.
+#
+# Boots the PVE API on https://localhost:8006 with the fixture VM and
+# fixture CT both pre-seeded. After `docker compose up -d`, give the
+# container ~20-30 seconds to settle (systemd boots pve-cluster +
+# pvedaemon + pveproxy + pvestatd, then the fixture seed runs), then:
+#
+#     curl -k https://localhost:8006/api2/json/version
+#     # → 401 — auth required; the daemon is up
+#
+#     curl -k -d 'username=root@pam&password=proxmox123' \
+#         https://localhost:8006/api2/json/access/ticket
+#
+# NOT FOR PRODUCTION USE. Hard-coded credentials, self-signed TLS,
+# --privileged runtime. See ../README.md for the full warning.
+
+services:
+  pve:
+    # Override at run-time with PVE_IMAGE=<repo>:<tag> if you need to
+    # pin a specific version or point at a locally-built image.
+    image: ${PVE_IMAGE:-ghcr.io/client-api/proxmox-docker/pve-test:9.2}
+    container_name: pve-test
+    hostname: pve-test
+    # `--privileged` is non-negotiable: pmxcfs is FUSE-mounted and
+    # systemd needs writable cgroup hierarchies. The two extra devices
+    # are optional:
+    #   /dev/fuse → pmxcfs (also covered by --privileged but explicit
+    #               makes the requirement visible)
+    #   /dev/kvm  → enables `qm start` against the fixture VM 100.
+    #               Comment out if the host lacks KVM; the rest of
+    #               the API still works.
+    privileged: true
+    devices:
+      - /dev/fuse
+      - /dev/kvm
+    tmpfs:
+      # systemd-as-PID-1 expects these to be writable tmpfs.
+      - /tmp
+      - /run
+      - /run/lock
+    ports:
+      - "8006:8006"
+    healthcheck:
+      test: ["CMD", "/usr/local/sbin/healthcheck.sh"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    environment:
+      # Override these to customise the bake-in defaults. All four are
+      # safe to leave at the documented values for any test scenario
+      # that doesn't expose the container to the public internet.
+      PVE_HOSTNAME: pve-test
+      PVE_FQDN: pve-test.local
+      PVE_ROOT_PASSWORD: proxmox123
+      PVE_API_TOKEN_NAME: test
+      # Disable individual fixtures with `0` if you want an empty PVE:
+      PVE_SEED_FIXTURE_VM: "1"
+      PVE_SEED_FIXTURE_CT: "1"
+    # Graceful shutdown — systemd as PID 1 listens for SIGRTMIN+3.
+    stop_signal: SIGRTMIN+3
+    stop_grace_period: 30s
